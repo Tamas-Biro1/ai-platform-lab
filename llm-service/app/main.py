@@ -84,14 +84,14 @@ async def summarize(body: LogIn, client: ClientDep) -> IncidentSummary:
 #    return StreamingResponse(events(), media_type="text/event-stream")
 
 
-def measure_and_done(start_time: float, ttft: float, token_count: int) -> str:
+def measure_and_done(start_time: float, ttft: float | None, chunk_count: int) -> str:
     end_time = perf_counter()
     total = end_time - start_time
     log.info(
         json.dumps(
             {'total_ms': round(total * 1000, 1) ,
              'ttft_ms': round(ttft * 1000) if ttft is not None else None,
-             'token_count': token_count
+             'token_count': chunk_count
             }))
     return "data: [DONE]\n\n"
 
