@@ -1,16 +1,14 @@
 import json
+import logging
 import os
-from typing import Literal
+import sys
+from time import perf_counter
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError
-
-import logging, sys
-
-from time import perf_counter
 
 MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
 BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
@@ -41,9 +39,10 @@ log.addHandler(logging.StreamHandler(sys.stdout))
 def get_client() -> AsyncOpenAI:
     return AsyncOpenAI(base_url=BASE_URL, api_key=os.getenv("LLM_API_KEY", "ollama"))
 
+ClientDep = Annotated[AsyncOpenAI, Depends(get_client)]
 
 @app.post("/summarize", response_model=IncidentSummary)
-async def summarize(body: LogIn, client: AsyncOpenAI = Depends(get_client)) -> IncidentSummary:
+async def summarize(body: LogIn, client: AsyncOpenAI = ClientDep) -> IncidentSummary:
     for _ in range(3):
         resp = await client.chat.completions.create(
             model=MODEL,
@@ -101,7 +100,7 @@ async def events(client: AsyncOpenAI, message: str):
         yield measure_and_done()
 
 @app.post("/chat")
-async def chat(body: LogIn, client: AsyncOpenAI = Depends(get_client)):
+async def chat(body: LogIn, client: AsyncOpenAI = ClientDep):
     global start_time
     start_time = perf_counter()
     return StreamingResponse(events(client, body.log), media_type="text/event-stream")
