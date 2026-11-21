@@ -23,26 +23,28 @@ class IncidentSummary(BaseModel):
 class LogIn(BaseModel):
     log: str = Field(min_length=1, max_length=20_000)
 
+
 SYSTEM = (
     "You are an SRE assistant. Only respond any objects that correspond to this JSON-schema:\n"
     + json.dumps(IncidentSummary.model_json_schema())
 )
 
 app = FastAPI()
-start_time: float
-
 
 log = logging.getLogger("my-logger")
 log.setLevel(logging.DEBUG)
 log.addHandler(logging.StreamHandler(sys.stdout))
 
+
 def get_client() -> AsyncOpenAI:
     return AsyncOpenAI(base_url=BASE_URL, api_key=os.getenv("LLM_API_KEY", "ollama"))
 
+
 ClientDep = Annotated[AsyncOpenAI, Depends(get_client)]
 
+
 @app.post("/summarize", response_model=IncidentSummary)
-async def summarize(body: LogIn, client: AsyncOpenAI = ClientDep) -> IncidentSummary:
+async def summarize(body: LogIn, client: ClientDep) -> IncidentSummary:
     for _ in range(3):
         resp = await client.chat.completions.create(
             model=MODEL,
@@ -54,15 +56,20 @@ async def summarize(body: LogIn, client: AsyncOpenAI = ClientDep) -> IncidentSum
             ],
         )
         try:
-            return IncidentSummary.model_validate_json(resp.choices[0].message.content or "")
+            return IncidentSummary.model_validate_json(
+                resp.choices[0].message.content or ""
+            )
         except ValidationError:
             continue  # model gave wrong JSON, retry...
-    raise HTTPException(status_code=502, detail="The model did not return a valid response after 3 attempts")
+    raise HTTPException(
+        status_code=502,
+        detail="The model did not return a valid response after 3 attempts",
+    )
 
 
-# implementation with closures
-#@app.post("/chat")
-#async def chat(body: LogIn, client: AsyncOpenAI = Depends(get_client)):
+# generator implementation with closures
+# @app.post("/chat")
+# async def chat(body: LogIn, client: AsyncOpenAI = Depends(get_client)):
 #    async def events():
 #        stream = await client.chat.completions.create(
 #            model=MODEL, stream=True,
@@ -76,32 +83,50 @@ async def summarize(body: LogIn, client: AsyncOpenAI = ClientDep) -> IncidentSum
 #
 #    return StreamingResponse(events(), media_type="text/event-stream")
 
-def measure_and_done() -> str:
+
+def measure_and_done(start_time: float, ttft: float, token_count: int) -> str:
     end_time = perf_counter()
-    elapsed_time = end_time - start_time
-    log.info(f"elapsed time: {elapsed_time}\n\n")
+    total = end_time - start_time
+    log.info(
+        json.dumps(
+            {'total_ms': round(total * 1000, 1) ,
+             'ttft_ms': round(ttft * 1000) if ttft is not None else None,
+             'token_count': token_count
+            }))
     return "data: [DONE]\n\n"
 
 
-async def events(client: AsyncOpenAI, message: str):
-        stream = await client.chat.completions.create(
-            model=MODEL, stream=True,
-            messages=[{"role": "user", "content": message}],
-            stream_options={"include_usage": True}
-        )
-        async for chunk in stream:
-            usage = chunk.usage
-            if usage:
-                yield f"event: usage\ndata: {json.dumps(usage.model_dump())}\n\n"
-                continue
+# generator function
+async def events(client: AsyncOpenAI, message: str, request_starttime: float):
+    # 'chunk' instead of 'token'
+    # vLLM server might merge more
+    # tokens into a chunk to send
+    # rough estimation for the usage (include_usage is better)
+    chunk_count = 0
+    ttft = None
+    stream = await client.chat.completions.create(
+        model=MODEL,
+        stream=True,
+        messages=[{"role": "user", "content": message}],
+        stream_options={"include_usage": True},
+    )
+    async for chunk in stream:
+        usage = chunk.usage
+        if usage:
+            yield f"event: usage\ndata: {json.dumps(usage.model_dump())}\n\n"
+            continue
+        if chunk.choices:
             text = chunk.choices[0].delta.content or ""
             if text:
+                chunk_count = chunk_count + 1
+                if chunk_count == 1:
+                    ttft_endtime = perf_counter()
+                    ttft = ttft_endtime - request_starttime
                 yield f"data: {json.dumps({'text': text})}\n\n"
-        yield measure_and_done()
+    yield measure_and_done(request_starttime, ttft, chunk_count)
+
 
 @app.post("/chat")
-async def chat(body: LogIn, client: AsyncOpenAI = ClientDep):
-    global start_time
-    start_time = perf_counter()
-    return StreamingResponse(events(client, body.log), media_type="text/event-stream")
-
+async def chat(body: LogIn, client: ClientDep):
+    request_starttime = perf_counter()
+    return StreamingResponse(events(client, body.log, request_starttime), media_type="text/event-stream")
